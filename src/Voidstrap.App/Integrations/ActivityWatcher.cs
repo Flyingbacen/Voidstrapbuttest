@@ -24,6 +24,10 @@ public partial class ActivityWatcher : IDisposable
 
     private const string SdkGameMessageEntry = "[FLog::Output] [BloxstrapRPC]";
 
+    private const string CreatorGameMessageEntry = "[FLog::CreatorOutput] [VoidstrapRPC]";
+
+    private const string CreatorSdkGameMessageEntry = "[FLog::CreatorOutput] [BloxstrapRPC]";
+
     private const int MaxRPCMessagesPerSecond = 60;
 
     private const string GameJoiningEntry = "[FLog::Output] ! Joining game";
@@ -73,6 +77,8 @@ public partial class ActivityWatcher : IDisposable
         GameTeleportEntry,
         SdkGameMessageEntry,
         GameMessageEntry,
+        CreatorSdkGameMessageEntry,
+        CreatorGameMessageEntry,
         GamePlayerDiscoveryEntry,
         GamePlayerJoinLeaveEntry,
         GameMessageLogEntry,
@@ -1496,7 +1502,10 @@ public partial class ActivityWatcher : IDisposable
                 }
             }
             else if (
-                entry.Contains(SdkGameMessageEntry, StringComparison.Ordinal) || entry.Contains(GameMessageEntry, StringComparison.Ordinal)
+                entry.Contains(SdkGameMessageEntry, StringComparison.Ordinal)
+                || entry.Contains(GameMessageEntry, StringComparison.Ordinal)
+                || entry.Contains(CreatorSdkGameMessageEntry, StringComparison.Ordinal)
+                || entry.Contains(CreatorGameMessageEntry, StringComparison.Ordinal)
             )
             {
                 Match match6 = LogPattern6.Match(entry);
