@@ -149,6 +149,20 @@ public partial class DiscordRichPresence : IDisposable
 
     private const ulong MaxUnixSeconds = 32503680000UL;
 
+    private const int ThumbnailCacheSize = 20;
+
+    private readonly Voidstrap.Utility.FixedSizeList<Voidstrap.Models.ThumbnailCacheEntry> _thumbnailCache = new Voidstrap.Utility.FixedSizeList<Voidstrap.Models.ThumbnailCacheEntry>(ThumbnailCacheSize);
+
+    private ulong? _pendingSmallAsset;
+
+    private ulong? _pendingLargeAsset;
+
+    private ulong? _fetchingSmallAsset;
+
+    private ulong? _fetchingLargeAsset;
+
+    private CancellationTokenSource? _thumbnailFetchCancellation;
+
     private readonly List<Message> _gameMessages = new List<Message>();
 
     private bool _gamePresenceActive;
@@ -213,6 +227,9 @@ public partial class DiscordRichPresence : IDisposable
         lock (_activityGate)
         {
             _activityRevision++;
+            StopThumbnailFetch();
+            _pendingSmallAsset = null;
+            _pendingLargeAsset = null;
             _gameCancellation?.Cancel();
             _gameCancellation?.Dispose();
             _gameCancellation = _disposed ? null : CancellationTokenSource.CreateLinkedTokenSource(_lifetimeToken);
@@ -568,15 +585,21 @@ public partial class DiscordRichPresence : IDisposable
             _gameMessages.Add(message);
             if (!_gamePresenceActive || _currentPresence == null || _originalSnapshot == null)
                 return;
-            if (ApplyRPCMessage(message) && implicitUpdate)
+            if (!ApplyRPCMessage(message))
+                return;
+            StartThumbnailFetch();
+            if (implicitUpdate)
                 UpdatePresence();
         }
     }
 
     private void ReplayGameMessages()
     {
+        _pendingSmallAsset = null;
+        _pendingLargeAsset = null;
         foreach (Message message in _gameMessages)
             ApplyRPCMessage(message);
+        StartThumbnailFetch();
     }
 
     private bool ApplyRPCMessage(Message message)
@@ -653,9 +676,13 @@ public partial class DiscordRichPresence : IDisposable
         return fitted.Length == 0 ? current : fitted;
     }
 
-    private static void UpdateAssets(Assets current, OriginalSnapshot original, RichPresenceImage? data, bool small)
+    private void UpdateAssets(Assets current, OriginalSnapshot original, RichPresenceImage? data, bool small)
     {
         if (data == null)
+        {
+            return;
+        }
+        if (small && App.Settings.Prop.ShowAccountOnRichPresence)
         {
             return;
         }
@@ -664,10 +691,12 @@ public partial class DiscordRichPresence : IDisposable
             if (small)
             {
                 current.SmallImageKey = "";
+                _pendingSmallAsset = null;
             }
             else
             {
                 current.LargeImageKey = "";
+                _pendingLargeAsset = null;
             }
             return;
         }
@@ -677,11 +706,13 @@ public partial class DiscordRichPresence : IDisposable
             {
                 current.SmallImageKey = original.SmallImageKey ?? "";
                 current.SmallImageText = original.SmallImageText ?? "";
+                _pendingSmallAsset = null;
             }
             else
             {
                 current.LargeImageKey = original.LargeImageKey ?? "";
                 current.LargeImageText = original.LargeImageText ?? "";
+                _pendingLargeAsset = null;
             }
             return;
         }
@@ -691,24 +722,18 @@ public partial class DiscordRichPresence : IDisposable
             if (small)
             {
                 current.SmallImageKey = customKey;
+                _pendingSmallAsset = null;
             }
             else
             {
                 current.LargeImageKey = customKey;
+                _pendingLargeAsset = null;
             }
             return;
         }
         if (data.AssetId.HasValue)
         {
-            string text = $"https://assetdelivery.roblox.com/v1/asset/?id={data.AssetId.Value}";
-            if (small)
-            {
-                current.SmallImageKey = text;
-            }
-            else
-            {
-                current.LargeImageKey = text;
-            }
+            ApplyAssetImage(current, data.AssetId.Value, small);
         }
         string hoverText = Voidstrap.Utility.DiscordPresenceGuard.Text(data.HoverText);
         if (hoverText.Length > 0)
@@ -720,6 +745,171 @@ public partial class DiscordRichPresence : IDisposable
             else
             {
                 current.LargeImageText = hoverText;
+            }
+        }
+    }
+
+    private void ApplyAssetImage(Assets current, ulong assetId, bool small)
+    {
+        string? cached = FindCachedThumbnail(assetId);
+        if (cached == null)
+        {
+            if (small)
+            {
+                _pendingSmallAsset = assetId;
+            }
+            else
+            {
+                _pendingLargeAsset = assetId;
+            }
+            return;
+        }
+        if (small)
+        {
+            current.SmallImageKey = cached;
+            _pendingSmallAsset = null;
+        }
+        else
+        {
+            current.LargeImageKey = cached;
+            _pendingLargeAsset = null;
+        }
+    }
+
+    private string? FindCachedThumbnail(ulong assetId)
+    {
+        foreach (Voidstrap.Models.ThumbnailCacheEntry entry in _thumbnailCache)
+        {
+            if (entry.Id == assetId)
+                return entry.Url;
+        }
+        return null;
+    }
+
+    private string CacheThumbnail(ulong? assetId, string? url)
+    {
+        string key = Voidstrap.Utility.DiscordPresenceGuard.Key(url);
+        if (assetId.HasValue && key.Length > 0)
+            _thumbnailCache.Add(new Voidstrap.Models.ThumbnailCacheEntry { Id = assetId.Value, Url = key });
+        return key;
+    }
+
+    private static Voidstrap.Models.APIs.Roblox.ThumbnailRequest BuildAssetThumbnailRequest(ulong assetId)
+    {
+        return new Voidstrap.Models.APIs.Roblox.ThumbnailRequest
+        {
+            TargetId = assetId,
+            Type = "Asset",
+            Size = "512x512",
+            IsCircular = false,
+        };
+    }
+
+    private void StopThumbnailFetch()
+    {
+        _thumbnailFetchCancellation?.Cancel();
+        _thumbnailFetchCancellation?.Dispose();
+        _thumbnailFetchCancellation = null;
+        _fetchingSmallAsset = null;
+        _fetchingLargeAsset = null;
+    }
+
+    private void StartThumbnailFetch()
+    {
+        ulong? small = _pendingSmallAsset;
+        ulong? large = _pendingLargeAsset;
+        if (small == _fetchingSmallAsset && large == _fetchingLargeAsset)
+            return;
+        StopThumbnailFetch();
+        if (_disposed || (small == null && large == null))
+            return;
+        CancellationTokenSource source = CancellationTokenSource.CreateLinkedTokenSource(_gameCancellation?.Token ?? _lifetimeToken);
+        _thumbnailFetchCancellation = source;
+        _fetchingSmallAsset = small;
+        _fetchingLargeAsset = large;
+        CancellationToken token = source.Token;
+        _ = Task.Run(() => FetchAssetThumbnailsAsync(small, large, token), token);
+    }
+
+    private async Task FetchAssetThumbnailsAsync(ulong? small, ulong? large, CancellationToken token)
+    {
+        string? smallUrl = null;
+        string? largeUrl = null;
+        try
+        {
+            if (small.HasValue && large.HasValue)
+            {
+                List<Voidstrap.Models.APIs.Roblox.ThumbnailRequest> requests = new List<Voidstrap.Models.APIs.Roblox.ThumbnailRequest>
+                {
+                    BuildAssetThumbnailRequest(small.Value),
+                    BuildAssetThumbnailRequest(large.Value),
+                };
+                string?[] urls = await Voidstrap.Utility.Thumbnails.GetThumbnailUrlsAsync(requests, token).ConfigureAwait(false);
+                smallUrl = urls[0];
+                largeUrl = urls[1];
+            }
+            else if (small.HasValue)
+            {
+                smallUrl = await Voidstrap.Utility.Thumbnails.GetThumbnailUrlAsync(BuildAssetThumbnailRequest(small.Value), token).ConfigureAwait(false);
+            }
+            else if (large.HasValue)
+            {
+                largeUrl = await Voidstrap.Utility.Thumbnails.GetThumbnailUrlAsync(BuildAssetThumbnailRequest(large.Value), token).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+        catch (Exception ex)
+        {
+            App.Logger.WriteLine(LOG_IDENT, "Custom presence images unavailable: " + ex.Message);
+            lock (_activityGate)
+            {
+                if (!token.IsCancellationRequested && _fetchingSmallAsset == small && _fetchingLargeAsset == large)
+                {
+                    _fetchingSmallAsset = null;
+                    _fetchingLargeAsset = null;
+                }
+            }
+            return;
+        }
+        lock (_activityGate)
+        {
+            if (_disposed || token.IsCancellationRequested)
+                return;
+            string smallKey = CacheThumbnail(small, smallUrl);
+            string largeKey = CacheThumbnail(large, largeUrl);
+            DiscordRPC.RichPresence? presence = _currentPresence;
+            Assets? assets = presence?.Assets;
+            bool changed = false;
+            if (small.HasValue && _pendingSmallAsset == small)
+            {
+                _pendingSmallAsset = null;
+                if (smallKey.Length > 0 && assets != null)
+                {
+                    assets.SmallImageKey = smallKey;
+                    changed = true;
+                }
+            }
+            if (large.HasValue && _pendingLargeAsset == large)
+            {
+                _pendingLargeAsset = null;
+                if (largeKey.Length > 0 && assets != null)
+                {
+                    assets.LargeImageKey = largeKey;
+                    changed = true;
+                }
+            }
+            _fetchingSmallAsset = null;
+            _fetchingLargeAsset = null;
+            if (!changed || !_gamePresenceActive || presence == null)
+                return;
+            string signature = BuildPresenceSignature(presence);
+            if (signature != _lastPresenceSignature)
+            {
+                _lastPresenceSignature = signature;
+                UpdatePresence();
             }
         }
     }
@@ -1916,6 +2106,7 @@ public partial class DiscordRichPresence : IDisposable
             _originalSnapshot = null;
             lock (_activityGate)
             {
+                StopThumbnailFetch();
                 _gameCancellation?.Cancel();
                 _gameCancellation?.Dispose();
                 _gameCancellation = null;
